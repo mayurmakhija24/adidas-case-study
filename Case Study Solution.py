@@ -1,17 +1,63 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC ###Creating the Spark session to perform all operations
+
+# COMMAND ----------
+
 import pandas as pd
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as f
 import requests
 
+spark = SparkSession.builder.getOrCreate()
+
 # COMMAND ----------
 
-spark = SparkSession.builder.getOrCreate()
+# MAGIC %md
+# MAGIC ###Reverting to the legacy Spark time parsing to handle the inconsistent publish date formats
+
+# COMMAND ----------
+
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Reading the JSON document straight out of S3 using inbuilt PySpark functions and checking the record count
+
+# COMMAND ----------
+
 df = spark.read.json("s3a://csparkdata/ol_cdump.json")
+
+# COMMAND ----------
+
+df.count()
+
+# COMMAND ----------
+
+df.printSchema()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Checking how many author names are not populated
+
+# COMMAND ----------
+
+spark.sql('''
+select 
+  case when name is null then "null"
+  else "not null"
+  end as author_name_status,
+  count(*)
+  from df
+  group by 1
+''').show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Parsing the inconsistent publish dates 
 
 # COMMAND ----------
 
@@ -45,6 +91,11 @@ df.createOrReplaceTempView("df")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Creating publish_year column
+
+# COMMAND ----------
+
 df_w_pub_year = spark.sql('''
   select *,
   case 
@@ -60,16 +111,28 @@ df_w_pub_year.createOrReplaceTempView("df_pub_year")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Applying data cleanup filters
+
+# COMMAND ----------
+
 df_cleaned = spark.sql('''
   select * from df_pub_year 
-  where title is not null
-  and lower(title) not like "%no title exists%"
-  and number_of_pages > 20
-  and publish_year > 1950
+  where number_of_pages > 20
+  and publish_year >= 1950
   and publish_date_formatted is not null
   and key is not null
   and authors is not null
 ''')
+
+# COMMAND ----------
+
+df_cleaned.count()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Creating a udf to parse the author keys present in the data as a list of tuples, in a more readable format
 
 # COMMAND ----------
 
@@ -81,11 +144,21 @@ spark.udf.register("parse_author_keys_udf", parse_author_keys)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Creating a udf to parse the book keys present in the data in a more readable format
+
+# COMMAND ----------
+
 def parse_book_key(book_key):
   return book_key.split("/")[2]
 
 parse_book_key_udf = f.udf(parse_book_key)
 spark.udf.register("parse_book_key_udf", parse_book_key)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Creating a udf to make a REST call to the OpenLibrary API to fetch the correct author names for the corresponding author keys
 
 # COMMAND ----------
 
@@ -115,6 +188,11 @@ df_cleaned.createOrReplaceTempView("data")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Q1: Get the book with the most pages
+
+# COMMAND ----------
+
 ques1 = spark.sql('''
   select distinct book_key, title as book_title, number_of_pages from
   (select *, dense_rank() over (order by number_of_pages desc) as page_rank from data)
@@ -124,6 +202,11 @@ ques1 = spark.sql('''
 # COMMAND ----------
 
 ques1
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Q2: Find the top 5 genres with most books
 
 # COMMAND ----------
 
@@ -149,6 +232,11 @@ ques2[ques2.genre_rank <= 5]
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Q3: Retrieve the top 5 authors who (co-)authored the most books
+
+# COMMAND ----------
+
 ques3_inter = spark.sql('''
   select *, explode(split(author_keys, ",")) as author_key from data
 ''')
@@ -170,6 +258,11 @@ ques3
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Per publish year, get the number of authors that published at least one book
+
+# COMMAND ----------
+
 ques4 = spark.sql('''
   select publish_year, count(distinct author_key) as authors from
   (select *, explode(split(author_keys, ",")) as author_key from data)
@@ -184,9 +277,15 @@ ques4
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ###Q5: Find the number of authors and number of books published per month for years between 1950 and 1970
+
+# COMMAND ----------
+
 ques5 = spark.sql('''
   select date_format(publish_date_formatted, "yyyy-MM") as publish_year_month, count(distinct author_key) as authors, count(distinct key) as books from
   (select *, explode(split(author_keys, ",")) as author_key from data)
+  where publish_year >= 1950 and publish_year <= 1970
   group by 1
   order by 1
 ''').toPandas()
